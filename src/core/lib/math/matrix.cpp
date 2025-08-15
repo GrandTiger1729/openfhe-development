@@ -31,7 +31,7 @@
 
 /*
   matrix class implementations and type specific implementations
- */
+*/
 
 #ifndef LBCRYPTO_LIB_MATH_MATRIX_CPP
 #define LBCRYPTO_LIB_MATH_MATRIX_CPP
@@ -42,7 +42,14 @@
 #include "utils/exception.h"
 #include "utils/parallel.h"
 
-// this is the implementation of matrixes of things that are in core
+#include <vector>
+#include <cstddef>
+#include <cmath>
+#if defined(__AVX2__)
+  #include <immintrin.h>
+#endif
+
+// this is the implementation of matrices of things that are in core
 // and that need template specializations
 
 namespace lbcrypto {
@@ -75,83 +82,102 @@ MODEQ_FOR_TYPE(BigInteger)
 MODSUBEQ_FOR_TYPE(NativeInteger)
 MODSUBEQ_FOR_TYPE(BigInteger)
 
-// YSP removed the Matrix class because it is not defined for all possible data
-// types needs to be checked to make sure input matrix is used in the right
-// places the assumption is that covariance matrix does not have large
-// coefficients because it is formed by discrete gaussians e and s; this implies
-// int32_t can be used This algorithm can be further improved - see the
-// Darmstadt paper section 4.4
-Matrix<double> Cholesky(const Matrix<int32_t>& input) {
-    //  http://eprint.iacr.org/2013/297.pdf
-    if (input.GetRows() != input.GetCols()) {
+// -----------------------------------------------------------------------------
+// SIMD Cholesky (int32 -> double) with scalar fallback
+// Assumption: input is symmetric positive definite; result is lower-triangular.
+// -----------------------------------------------------------------------------
+
+static inline void CholeskyKernelSIMD_RowMajor(double* A, std::size_t n) {
+    std::vector<double> colk(n);
+
+    for (std::size_t k = 0; k < n; ++k) {
+        // diagonal
+        double akk = std::sqrt(A[k * n + k]);
+        A[k * n + k] = akk;
+
+        // normalize column k below diagonal; zero upper triangle of row k
+        for (std::size_t i = k + 1; i < n; ++i) {
+            A[i * n + k] /= akk;
+            A[k * n + i]  = 0.0;
+        }
+
+        // cache column k (contiguous)
+        colk[k] = akk; // diag kept; not used in updates
+        for (std::size_t i = k + 1; i < n; ++i) {
+            colk[i] = A[i * n + k];
+        }
+
+        // trailing update: for j = k+1..i, A[i,j] -= A[i,k] * A[j,k]
+        for (std::size_t i = k + 1; i < n; ++i) {
+            const double aik = colk[i];
+
+        #if defined(__AVX2__)
+            __m256d aik_v = _mm256_set1_pd(aik);
+            std::size_t j = k + 1;
+
+            // vectorized along row i: process 4 doubles per iter
+            for (; j + 3 < i + 1; j += 4) {
+                __m256d ck_v  = _mm256_loadu_pd(&colk[j]);
+                __m256d aij_v = _mm256_loadu_pd(&A[i * n + j]);
+                aij_v = _mm256_sub_pd(aij_v, _mm256_mul_pd(aik_v, ck_v));
+                _mm256_storeu_pd(&A[i * n + j], aij_v);
+            }
+            // scalar tail
+            for (; j <= i; ++j) {
+                A[i * n + j] -= aik * colk[j];
+            }
+        #else
+            // pure scalar fallback
+            for (std::size_t j = k + 1; j <= i; ++j) {
+                A[i * n + j] -= aik * colk[j];
+            }
+        #endif
+        }
+    }
+}
+
+inline Matrix<double> CholeskySIMD(const Matrix<int32_t>& input) {
+    const std::size_t n = input.GetRows();
+    if (n != input.GetCols()) {
         OPENFHE_THROW("not square");
     }
-    size_t rows = input.GetRows();
-    Matrix<double> result([]() { return 0; }, rows, rows);
 
-    for (size_t i = 0; i < rows; ++i) {
-        for (size_t j = 0; j < rows; ++j) {
-            result(i, j) = input(i, j);
+    // copy Matrix<int32_t> -> contiguous row-major double buffer
+    std::vector<double> buf(n * n);
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < n; ++j) {
+            buf[i * n + j] = static_cast<double>(input(i, j));
         }
     }
 
-    for (size_t k = 0; k < rows; ++k) {
-        result(k, k) = sqrt(result(k, k));
-        // result(k, k) = sqrt(input(k, k));
-        for (size_t i = k + 1; i < rows; ++i) {
-            // result(i, k) = input(i, k) / result(k, k);
-            result(i, k) = result(i, k) / result(k, k);
-            //  zero upper-right triangle
-            result(k, i) = 0;
-        }
-        for (size_t j = k + 1; j < rows; ++j) {
-            for (size_t i = j; i < rows; ++i) {
-                if (result(i, k) != 0 && result(j, k) != 0) {
-                    result(i, j) = result(i, j) - result(i, k) * result(j, k);
-                    // result(i, j) = input(i, j) - result(i, k) * result(j, k);
-                }
-            }
+    // run kernel
+    CholeskyKernelSIMD_RowMajor(buf.data(), n);
+
+    // copy back to Matrix<double>
+    Matrix<double> result([]() { return 0.0; }, n, n);
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = 0; j < n; ++j) {
+            result(i, j) = buf[i * n + j];
         }
     }
     return result;
 }
 
+// Public APIs (same signatures as original)
+Matrix<double> Cholesky(const Matrix<int32_t>& input) {
+    return CholeskySIMD(input);
+}
+
 void Cholesky(const Matrix<int32_t>& input, Matrix<double>& result) {
-    //  http://eprint.iacr.org/2013/297.pdf
     if (input.GetRows() != input.GetCols()) {
         OPENFHE_THROW("not square");
     }
-    size_t rows = input.GetRows();
-    //  Matrix<LargeFloat> result([]() { return make_unique<LargeFloat>(); },
-    // rows, rows);
-
-    for (size_t i = 0; i < rows; ++i) {
-        for (size_t j = 0; j < rows; ++j) {
-            result(i, j) = input(i, j);
-        }
-    }
-
-    for (size_t k = 0; k < rows; ++k) {
-        result(k, k) = sqrt(input(k, k));
-
-        for (size_t i = k + 1; i < rows; ++i) {
-            // result(i, k) = input(i, k) / result(k, k);
-            result(i, k) = result(i, k) / result(k, k);
-            //  zero upper-right triangle
-            result(k, i) = 0;
-        }
-        for (size_t j = k + 1; j < rows; ++j) {
-            for (size_t i = j; i < rows; ++i) {
-                if (result(i, k) != 0 && result(j, k) != 0) {
-                    result(i, j) = result(i, j) - result(i, k) * result(j, k);
-                    // result(i, j) = input(i, j) - result(i, k) * result(j, k);
-                }
-            }
-        }
-    }
+    result = CholeskySIMD(input);
 }
 
-//  Convert from Z_q to [-q/2, q/2]
+// -----------------------------------------------------------------------------
+// Convert from Z_q to [-q/2, q/2]
+// -----------------------------------------------------------------------------
 Matrix<int32_t> ConvertToInt32(const Matrix<BigInteger>& input, const BigInteger& modulus) {
     size_t rows = input.GetRows();
     size_t cols = input.GetCols();
@@ -189,10 +215,12 @@ Matrix<int32_t> ConvertToInt32(const Matrix<BigVector>& input, const BigInteger&
     return result;
 }
 
+// Keep explicit instantiations only in one TU to avoid ODR issues.
+// If another TU already instantiates these, remove the lines below.
 template class Matrix<double>;
 template class Matrix<int>;
 template class Matrix<int64_t>;
 
 }  // namespace lbcrypto
 
-#endif
+#endif // LBCRYPTO_LIB_MATH_MATRIX_CPP
