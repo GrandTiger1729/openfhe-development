@@ -41,6 +41,9 @@
 
 #include <complex>
 #include <vector>
+#if defined(__AVX2__)
+  #include <immintrin.h>
+#endif
 
 namespace lbcrypto {
 
@@ -144,6 +147,71 @@ std::vector<std::complex<double>> DiscreteFourierTransform::FFTForwardTransform(
         usint halfsize  = size / 2;
         usint tablestep = m / size;
         for (usint i = 0; i < m; i += size) {
+#if defined(__AVX2__)
+            // AVX2 path: process 2 butterflies per iteration when possible
+            usint j = i;
+            usint k = 0;
+            for (; j + 1 < i + halfsize; j += 2, k += 2 * tablestep) {
+                // Load inputs (two butterflies)
+                double vr0 = B[j + halfsize].real();
+                double vi0 = B[j + halfsize].imag();
+                double vr1 = B[j + halfsize + 1].real();
+                double vi1 = B[j + halfsize + 1].imag();
+
+                double cr0 = cosTable[l][k];
+                double sr0 = sinTable[l][k];
+                double cr1 = cosTable[l][k + tablestep];
+                double sr1 = sinTable[l][k + tablestep];
+
+                // Pack as [vi1, vr1, vi0, vr0] and [sr1, cr1, sr0, cr0]
+                __m256d V = _mm256_set_pd(vi1, vr1, vi0, vr0);
+                __m256d C = _mm256_set_pd(sr1, cr1, sr0, cr0);
+
+                // Real parts: (vr*cr - vi*sr) per pair
+                __m256d A = _mm256_mul_pd(V, C);
+                __m256d Rpairs = _mm256_hsub_pd(A, A); // [r0, r1, r0, r1]
+
+                // Imag parts: (vi*cr + vr*sr) per pair
+                __m256d Vsw = _mm256_permute_pd(V, 0b0101); // swap vr<->vi within pairs
+                __m256d Bv  = _mm256_mul_pd(Vsw, C);
+                __m256d Ipairs = _mm256_hadd_pd(Bv, Bv); // [i0, i1, i0, i1]
+
+                alignas(32) double rbuf[4];
+                alignas(32) double ibuf[4];
+                _mm256_storeu_pd(rbuf, Rpairs);
+                _mm256_storeu_pd(ibuf, Ipairs);
+
+                double tpre0 = rbuf[0];
+                double tpre1 = rbuf[1];
+                double tpim0 = ibuf[0];
+                double tpim1 = ibuf[1];
+
+                // j butterfly
+                double ureal = B[j].real();
+                double uimag = B[j].imag();
+                B[j + halfsize].real(ureal - tpre0);
+                B[j + halfsize].imag(uimag - tpim0);
+                B[j].real(ureal + tpre0);
+                B[j].imag(uimag + tpim0);
+
+                // j+1 butterfly
+                ureal = B[j + 1].real();
+                uimag = B[j + 1].imag();
+                B[j + halfsize + 1].real(ureal - tpre1);
+                B[j + halfsize + 1].imag(uimag - tpim1);
+                B[j + 1].real(ureal + tpre1);
+                B[j + 1].imag(uimag + tpim1);
+            }
+            // Scalar tail (or if halfsize == 1)
+            for (; j < i + halfsize; ++j, k += tablestep) {
+                double tpre = B[j + halfsize].real() * cosTable[l][k] + B[j + halfsize].imag() * sinTable[l][k];
+                double tpim = -B[j + halfsize].real() * sinTable[l][k] + B[j + halfsize].imag() * cosTable[l][k];
+                B[j + halfsize].real(B[j].real() - tpre);
+                B[j + halfsize].imag(B[j].imag() - tpim);
+                B[j].real(B[j].real() + tpre);
+                B[j].imag(B[j].imag() + tpim);
+            }
+#else
             for (usint j = i, k = 0; j < i + halfsize; j++, k += tablestep) {
                 double tpre = B[j + halfsize].real() * cosTable[l][k] + B[j + halfsize].imag() * sinTable[l][k];
                 double tpim = -B[j + halfsize].real() * sinTable[l][k] + B[j + halfsize].imag() * cosTable[l][k];
@@ -152,6 +220,7 @@ std::vector<std::complex<double>> DiscreteFourierTransform::FFTForwardTransform(
                 B[j].real(B[j].real() + tpre);
                 B[j].imag(B[j].imag() + tpim);
             }
+#endif
         }
         if (size == m)  // Prevent overflow in 'size *= 2'
             break;
